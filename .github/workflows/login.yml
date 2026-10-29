@@ -1,0 +1,40 @@
+name: Login and Save Session
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: instagram-login
+  cancel-in-progress: false
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Login with retry on challenge
+        env:
+          IG_USERNAME: ${{ secrets.IG_USERNAME }}
+          IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
+          SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}
+          IG_2FA_CODE: ${{ secrets.IG_2FA_CODE }}
+        run: python scripts/login.py
+      - name: Commit encrypted session
+        run: |
+          if [ -f data/session.enc ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/session.enc
+            if ! git diff --staged --quiet; then
+              git commit -m "chore(session): encrypted session [skip ci]"
+              git push
+            fi
+          else
+            echo "No session file produced"
+            exit 1
+          fi

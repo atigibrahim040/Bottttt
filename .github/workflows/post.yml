@@ -1,0 +1,36 @@
+name: Post Video
+on:
+  schedule:
+    - cron: '0 5 * * *'
+    - cron: '0 12 * * *'
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: instagram-post
+  cancel-in-progress: false
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Post next video
+        env:
+          SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}
+        run: python scripts/post_video.py
+      - name: Commit queue update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/queue.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(queue): mark posted [skip ci]"
+            git push
+          fi
