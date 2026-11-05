@@ -21,6 +21,7 @@ def load_client():
 
 def main():
     cl = load_client()
+    cl.expose = lambda *args, **kwargs: True
     sources = json.loads(SOURCES_FILE.read_text(encoding="utf-8")) if SOURCES_FILE.exists() else ["quran"]
     history = json.loads(HISTORY_FILE.read_text(encoding="utf-8")) if HISTORY_FILE.exists() else []
     random.shuffle(sources)
