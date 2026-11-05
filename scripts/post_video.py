@@ -177,8 +177,12 @@ def main():
                 print("No new valid videos. Waiting 10 seconds...")
             time.sleep(10)
         except Exception as e:
+            if "Challenge" in type(e).__name__ or "Challenge" in str(e):
+                print("CHALLENGE DETECTED! Stopping to protect account.")
+                print(str(e)[:300])
+                sys.exit(1)
             print(f"Monitor error: {e}")
-            time.sleep(10)
+            time.sleep(30)
     print("Time limit reached.")
 
 if __name__ == "__main__":
