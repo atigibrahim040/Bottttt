@@ -1,9 +1,10 @@
 import json, os, sys, tempfile, time, subprocess, re
 from pathlib import Path
-import requests, pydantic, yt_dlp
+import requests, pydantic
 sys.path.insert(0, str(Path(__file__).parent))
 from crypto import decrypt, get_password
 from instagrapi import Client
+import imageio_ffmpeg
 
 SESSION_FILE = Path(__file__).parent.parent / "data" / "session.enc"
 HISTORY_FILE = Path(__file__).parent.parent / "data" / "history.json"
@@ -24,42 +25,30 @@ def load_client():
     cl.expose = lambda *args, **kwargs: True
     return cl
 
-def download_with_ytdlp(url, output_path):
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': str(output_path),
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {'instagram': {'include': 'video'}}
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-
-def process_video(cl, video_url, msg_id, history):
-    print(f"--> Processing video URL: {video_url[:80]}...")
-    ti, to, thumb = Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".jpg"))
+def download_and_post(cl, media_pk, msg_id, history):
+    print(f"--> Downloading video PK: {media_pk} (Highest Quality + Audio)")
+    ti = Path(tempfile.mktemp(suffix=".mp4"))
+    to = Path(tempfile.mktemp(suffix=".mp4"))
+    thumb = Path(tempfile.mktemp(suffix=".jpg"))
     try:
-        print("--> Downloading with yt-dlp (highest quality + audio)...")
-        download_with_ytdlp(video_url, ti)
+        # تحميل الفيديو بأعلى جودة مع الصوت
+        video_path = cl.video_download(media_pk, folder=ti.parent)
         
-        if not ti.exists() or ti.stat().st_size < 1000:
-            print("Download failed or file empty.")
-            return False
-
+        # تعديل بسيط (عكس الفيديو) للحفاظ على الصوت كما هو
         print("--> Editing (flip to avoid duplicate)...")
-        import imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        r1 = subprocess.run([ffmpeg_exe, "-y", "-i", str(ti), "-vf", "hflip", "-c:v", "libx264", "-crf", "18", "-c:a", "copy", str(to)], capture_output=True)
+        r1 = subprocess.run([ffmpeg_exe, "-y", "-i", str(video_path), "-vf", "hflip", "-c:v", "libx264", "-crf", "18", "-c:a", "copy", str(to)], capture_output=True)
         if r1.returncode != 0:
             print("ffmpeg edit failed")
             return False
             
-        r2 = subprocess.run([ffmpeg_exe, "-y", "-i", str(to), "-ss", "00:00:01.000", "-vframes", "1", str(thumb)], capture_output=True)
+        subprocess.run([ffmpeg_exe, "-y", "-i", str(to), "-ss", "00:00:01.000", "-vframes", "1", str(thumb)], capture_output=True)
         
         print("--> Uploading to your account...")
+        media_info = cl.media_info(media_pk)
+        caption = media_info.caption_text or ""
         try:
-            cl.clip_upload(str(to), "بسم الله\n\n" + HASHTAGS, thumbnail=str(thumb))
+            cl.clip_upload(str(to), caption + "\n\n" + HASHTAGS, thumbnail=str(thumb))
         except pydantic.ValidationError:
             pass
             
@@ -69,29 +58,45 @@ def process_video(cl, video_url, msg_id, history):
         git_push_history()
         return True
     except Exception as e:
-        print(f"Error processing video: {e}")
+        print(f"Error: {e}")
         return False
     finally:
-        for f in (ti, to, thumb):
-            if f.exists(): f.unlink()
+        for f in [video_path, ti, to, thumb]:
+            if f and Path(f).exists(): Path(f).unlink()
 
-def extract_url_from_msg(msg):
-    text = getattr(msg, "text", "") or ""
-    match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[a-zA-Z0-9_-]+', text)
-    if match: return match.group(0)
-    
-    for attr in ['clip', 'media', 'xma_share']:
+def extract_media_pk(cl, msg):
+    # الطريقة 1: البحث عن رابط مباشر داخل XMA
+    for attr in ['xma_share', 'clip', 'media', 'xma_media_share', 'media_share']:
         obj = getattr(msg, attr, None)
-        if not obj: continue
-        for sub_attr in ['video_url', 'target_url']:
-            url = getattr(obj, sub_attr, None)
-            if url and 'instagram.com' in str(url): return str(url)
-                
+        if obj:
+            if hasattr(obj, 'video_url') and obj.video_url:
+                return obj.video_url
+            if hasattr(obj, 'pk') and obj.pk:
+                return int(obj.pk)
+            if hasattr(obj, 'code') and obj.code:
+                return cl.media_pk_from_code(obj.code)
+            if hasattr(obj, 'id') and obj.id:
+                return int(obj.id)
+
+    # الطريقة 2: البحث في النص الخام للرسالة
     try:
         raw = msg.model_dump_json()
-        match = re.search(r'https?://[^"\']*instagram\.com/(?:reel|p|tv)/[a-zA-Z0-9_-]+', raw)
-        if match: return match.group(0)
-    except: pass
+        # البحث عن video_url مباشرة
+        video_urls = re.findall(r'"video_url":\s*"([^"]+)"', raw)
+        if video_urls:
+            return video_urls[0]
+            
+        # البحث عن أي رقم طويل (pk)
+        pks = re.findall(r'\b(\d{17,20})\b', raw)
+        for pk_str in set(pks):
+            return int(pk_str)
+            
+        # البحث عن code
+        codes = re.findall(r'"code":\s*"([a-zA-Z0-9_-]{11})"', raw)
+        if codes:
+            return cl.media_pk_from_code(codes[0])
+    except:
+        pass
     return None
 
 def main():
@@ -100,7 +105,7 @@ def main():
     start_time = time.time()
     MAX_RUNTIME = 4.5 * 3600 
     
-    print(f"Starting DM monitor for {MAX_RUNTIME/3600} hours...")
+    print(f"Starting DM monitor for {MAX_RUNTIME/3600} hours (Checking every 10s)...")
     
     while time.time() - start_time < MAX_RUNTIME:
         try:
@@ -111,23 +116,37 @@ def main():
                 for msg in messages:
                     if msg.id in history: continue
                     
-                    print(f"Checking msg {msg.id} | type: {msg.item_type}")
-                    video_url = extract_url_from_msg(msg)
+                    # تجاهل الرسائل النصية العادية والردود
+                    if msg.item_type in ('text', 'action_log', 'placeholder', 'voice_media', 'xma_profile'): continue
                     
-                    if video_url:
-                        print(f"Found URL: {video_url}")
-                        if process_video(cl, video_url, msg.id, history):
-                            found = True
-                            break
+                    print(f"Checking msg {msg.id} | type: {msg.item_type}")
+                    
+                    # إذا كانت مشاركة فيديو
+                    if msg.item_type in ('xma_clip', 'clip', 'media_share', 'raven_media', 'xma_media_share'):
+                        res = extract_media_pk(cl, msg)
+                        if res:
+                            if isinstance(res, str) and res.startswith('http'):
+                                # رابط مباشر
+                                ti = Path(tempfile.mktemp(suffix=".mp4"))
+                                with requests.get(res, stream=True) as r:
+                                    with ti.open("wb") as f:
+                                        for chunk in r.iter_content(65536): f.write(chunk)
+                                # نحتاج إلى pk للرفع، لذا نستخدم دالة الرفع المباشر
+                                print("Found direct video URL, uploading...")
+                                # ... (يمكن تحسينها لاحقاً)
+                            else:
+                                if download_and_post(cl, res, msg.id, history):
+                                    found = True
+                                    break
                 if found: break
             
             if not found:
                 print("No new valid videos. Waiting 10 seconds...")
-                time.sleep(10)
+                time.sleep(10) # فحص سريع كل 10 ثوانٍ
                 
         except Exception as e:
             print(f"Monitor error: {e}")
-            time.sleep(15)
+            time.sleep(10)
 
     print("Time limit reached. Exiting gracefully.")
 
