@@ -1,4 +1,4 @@
-import json, os, random, sys, tempfile
+import json, os, random, sys, tempfile, time
 from pathlib import Path
 import requests
 sys.path.insert(0, str(Path(__file__).parent))
@@ -29,15 +29,19 @@ def main():
     for source in sources:
         try:
             uid = cl.user_id_from_username(source)
+            time.sleep(3) # تأخير لتجنب خطأ 429
             for c in cl.user_clips(uid, amount=5):
-                if c.pk not in history and c.video_url:
+                if c.pk not in history and getattr(c, 'video_url', None):
                     selected = c
                     break
             if selected: break
         except Exception as e:
             print(f"Error {source}: {e}")
+            time.sleep(5)
+            
     if not selected: sys.exit("No new clips found.")
     print(f"Selected: {selected.pk} from @{selected.user.username}")
+    
     ti, to = Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".mp4"))
     try:
         print("Downloading...")
@@ -45,15 +49,19 @@ def main():
             r.raise_for_status()
             with ti.open("wb") as f:
                 for chunk in r.iter_content(65536): f.write(chunk)
+                
         print("Editing to avoid duplicate detection (flip + speed)...")
         clip = VideoFileClip(str(ti))
         if clip.duration > 2: clip = clip.subclip(0.5, clip.duration - 0.5)
         clip = clip.fx(vfx.mirror_x).fx(vfx.speedx, 1.05)
         clip.write_videofile(str(to), codec="libx264", audio_codec="aac", logger=None)
         clip.close()
+        
         print("Uploading...")
-        cl.clip_upload(str(to), (selected.caption or "") + "\n\n" + HASHTAGS)
+        caption = getattr(selected, 'caption_text', '') or ""
+        cl.clip_upload(str(to), caption + "\n\n" + HASHTAGS)
         print("POSTED SUCCESSFULLY")
+        
         history.append(selected.pk)
         HISTORY_FILE.write_text(json.dumps(history, indent=2))
     finally:
