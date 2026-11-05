@@ -1,10 +1,9 @@
-import json, os, random, sys, tempfile, time
+import json, os, random, sys, tempfile, time, subprocess
 from pathlib import Path
 import requests
 sys.path.insert(0, str(Path(__file__).parent))
 from crypto import decrypt, get_password
 from instagrapi import Client
-from moviepy.editor import VideoFileClip, vfx
 
 SESSION_FILE = Path(__file__).parent.parent / "data" / "session.enc"
 SOURCES_FILE = Path(__file__).parent.parent / "data" / "sources.json"
@@ -29,7 +28,7 @@ def main():
     for source in sources:
         try:
             uid = cl.user_id_from_username(source)
-            time.sleep(3) # تأخير لتجنب خطأ 429
+            time.sleep(3) 
             for c in cl.user_clips(uid, amount=5):
                 if c.pk not in history and getattr(c, 'video_url', None):
                     selected = c
@@ -50,13 +49,19 @@ def main():
             with ti.open("wb") as f:
                 for chunk in r.iter_content(65536): f.write(chunk)
                 
-        print("Editing to avoid duplicate detection (flip + speed)...")
-        clip = VideoFileClip(str(ti))
-        if clip.duration > 2: clip = clip.subclip(0.5, clip.duration - 0.5)
-        clip = clip.fx(vfx.mirror_x).fx(vfx.speedx, 1.05)
-        clip.write_videofile(str(to), codec="libx264", audio_codec="aac", logger=None)
-        clip.close()
+        print("Editing to avoid duplicate detection (ffmpeg flip + speed)...")
+        process = subprocess.run([
+            "ffmpeg", "-y", "-i", str(ti),
+            "-vf", "hflip,setpts=0.95*PTS",
+            "-af", "atempo=1.05",
+            "-c:v", "libx264", "-c:a", "aac",
+            str(to)
+        ], capture_output=True)
         
+        if process.returncode != 0:
+            print("FFmpeg error:", process.stderr.decode())
+            raise Exception("Video processing failed")
+
         print("Uploading...")
         caption = getattr(selected, 'caption_text', '') or ""
         cl.clip_upload(str(to), caption + "\n\n" + HASHTAGS)
