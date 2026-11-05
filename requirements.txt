@@ -1,3 +1,4 @@
-instagrapi>=3.0.18
+instagrapi==2.2.1
 pycryptodome==3.20.0
-requests>=2.34.2
+requests==2.32.4
+Pillow==10.3.0
