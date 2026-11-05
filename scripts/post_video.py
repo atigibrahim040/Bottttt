@@ -1,10 +1,9 @@
 import json, os, sys, tempfile, time, subprocess, re
 from pathlib import Path
-import requests, pydantic
+import requests, pydantic, yt_dlp
 sys.path.insert(0, str(Path(__file__).parent))
 from crypto import decrypt, get_password
 from instagrapi import Client
-import imageio_ffmpeg
 
 SESSION_FILE = Path(__file__).parent.parent / "data" / "session.enc"
 HISTORY_FILE = Path(__file__).parent.parent / "data" / "history.json"
@@ -25,22 +24,31 @@ def load_client():
     cl.expose = lambda *args, **kwargs: True
     return cl
 
-def process_video(cl, media_pk, msg_id, history):
-    print(f"Processing media PK: {media_pk}")
+def download_with_ytdlp(url, output_path):
+    ydl_opts = {
+        'format': 'bestvideo+bestaudio/best',
+        'outtmpl': str(output_path),
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {'instagram': {'include': 'video'}}
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+def process_video(cl, video_url, msg_id, history):
+    print(f"--> Processing video URL: {video_url[:80]}...")
     ti, to, thumb = Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".jpg"))
     try:
-        media = cl.media_info(media_pk)
-        if not media.video_url:
-            print("Not a video, skipping.")
+        print("--> Downloading with yt-dlp (highest quality + audio)...")
+        download_with_ytdlp(video_url, ti)
+        
+        if not ti.exists() or ti.stat().st_size < 1000:
+            print("Download failed or file empty.")
             return False
-            
-        print("Downloading high quality video...")
-        with requests.get(media.video_url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with ti.open("wb") as f:
-                for chunk in r.iter_content(65536): f.write(chunk)
-                
-        print("Editing (flip to avoid duplicate)...")
+
+        print("--> Editing (flip to avoid duplicate)...")
+        import imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         r1 = subprocess.run([ffmpeg_exe, "-y", "-i", str(ti), "-vf", "hflip", "-c:v", "libx264", "-crf", "18", "-c:a", "copy", str(to)], capture_output=True)
         if r1.returncode != 0:
@@ -49,10 +57,9 @@ def process_video(cl, media_pk, msg_id, history):
             
         r2 = subprocess.run([ffmpeg_exe, "-y", "-i", str(to), "-ss", "00:00:01.000", "-vframes", "1", str(thumb)], capture_output=True)
         
-        print("Uploading to your account...")
-        caption = media.caption_text or ""
+        print("--> Uploading to your account...")
         try:
-            cl.clip_upload(str(to), caption + "\n\n" + HASHTAGS, thumbnail=str(thumb))
+            cl.clip_upload(str(to), "بسم الله\n\n" + HASHTAGS, thumbnail=str(thumb))
         except pydantic.ValidationError:
             pass
             
@@ -68,30 +75,23 @@ def process_video(cl, media_pk, msg_id, history):
         for f in (ti, to, thumb):
             if f.exists(): f.unlink()
 
-def extract_pk(msg):
-    # 1. البحث في xma_share
-    if getattr(msg, 'xma_share', None):
-        if getattr(msg.xma_share, 'video', None) and getattr(msg.xma_share.video, 'pk', None):
-            return msg.xma_share.video.pk
-        if getattr(msg.xma_share, 'media', None) and getattr(msg.xma_share.media, 'pk', None):
-            return msg.xma_share.media.pk
-
-    # 2. البحث في clip أو media
-    if getattr(msg, 'clip', None) and getattr(msg.clip, 'pk', None):
-        return msg.clip.pk
-    if getattr(msg, 'media', None) and getattr(msg.media, 'pk', None):
-        return msg.media.pk
-        
-    # 3. خطة الطوارئ: قراءة الـ JSON الخام واستخراج الـ pk
+def extract_url_from_msg(msg):
+    text = getattr(msg, "text", "") or ""
+    match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[a-zA-Z0-9_-]+', text)
+    if match: return match.group(0)
+    
+    for attr in ['clip', 'media', 'xma_share']:
+        obj = getattr(msg, attr, None)
+        if not obj: continue
+        for sub_attr in ['video_url', 'target_url']:
+            url = getattr(obj, sub_attr, None)
+            if url and 'instagram.com' in str(url): return str(url)
+                
     try:
-        raw_json = msg.model_dump_json()
-        # البحث عن أي pk يبدأ بـ 20 رقم أو أكثر (عادة أرقام الفيديوهات طويلة)
-        match = re.search(r'"pk":\s*"?(\d{15,})"?', raw_json)
-        if match:
-            return int(match.group(1))
-    except:
-        pass
-        
+        raw = msg.model_dump_json()
+        match = re.search(r'https?://[^"\']*instagram\.com/(?:reel|p|tv)/[a-zA-Z0-9_-]+', raw)
+        if match: return match.group(0)
+    except: pass
     return None
 
 def main():
@@ -111,34 +111,23 @@ def main():
                 for msg in messages:
                     if msg.id in history: continue
                     
-                    text = getattr(msg, "text", "") or ""
                     print(f"Checking msg {msg.id} | type: {msg.item_type}")
+                    video_url = extract_url_from_msg(msg)
                     
-                    pk = extract_pk(msg)
-                    
-                    # إذا لم نجد PK، نجرب الروابط النصية
-                    if not pk and text:
-                        match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/([a-zA-Z0-9_-]+)', text)
-                        if match:
-                            try:
-                                pk = cl.media_pk_from_code(match.group(1))
-                            except:
-                                pass
-
-                    if pk:
-                        print(f"Extracted PK: {pk}")
-                        if process_video(cl, pk, msg.id, history):
+                    if video_url:
+                        print(f"Found URL: {video_url}")
+                        if process_video(cl, video_url, msg.id, history):
                             found = True
                             break
                 if found: break
             
             if not found:
-                print("No new valid videos. Waiting 30 seconds...")
-                time.sleep(30)
+                print("No new valid videos. Waiting 10 seconds...")
+                time.sleep(10)
                 
         except Exception as e:
             print(f"Monitor error: {e}")
-            time.sleep(30)
+            time.sleep(15)
 
     print("Time limit reached. Exiting gracefully.")
 
