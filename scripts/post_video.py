@@ -26,7 +26,7 @@ def load_client():
     return cl
 
 def process_video(cl, media_pk, msg_id, history):
-    print(f"Processing media_pk: {media_pk}")
+    print(f"Processing media PK: {media_pk}")
     ti, to, thumb = Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".jpg"))
     try:
         media = cl.media_info(media_pk)
@@ -49,7 +49,7 @@ def process_video(cl, media_pk, msg_id, history):
             
         r2 = subprocess.run([ffmpeg_exe, "-y", "-i", str(to), "-ss", "00:00:01.000", "-vframes", "1", str(thumb)], capture_output=True)
         
-        print("Uploading...")
+        print("Uploading to your account...")
         caption = media.caption_text or ""
         try:
             cl.clip_upload(str(to), caption + "\n\n" + HASHTAGS, thumbnail=str(thumb))
@@ -81,7 +81,6 @@ def main():
             threads = cl.direct_threads(amount=5)
             found = False
             for thread in threads:
-                # جلب آخر 5 رسائل من كل محادثة
                 messages = cl.direct_messages(thread.id, amount=5)
                 for msg in messages:
                     if msg.id in history: continue
@@ -89,21 +88,26 @@ def main():
                     text = getattr(msg, "text", "") or ""
                     print(f"Checking msg {msg.id} | type: {msg.item_type} | text: {text[:50]}")
                     
-                    # الحالة 1: رسالة نصية فيها رابط
-                    match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/([a-zA-Z0-9_-]+)', text)
-                    if match:
-                        pk = cl.media_pk_from_url(match.group(0))
+                    pk = None
+                    # استخراج الـ PK من مشاركة الريلز (xma_clip) أو الرسائل العادية
+                    if msg.item_type == 'xma_clip':
+                        if getattr(msg, 'clip', None) and getattr(msg.clip, 'pk', None):
+                            pk = msg.clip.pk
+                        elif getattr(msg, 'xma_share', None) and getattr(msg.xma_share, 'video', None):
+                            pk = msg.xma_share.video.pk
+                    elif msg.item_type == 'media_share':
+                        if getattr(msg, 'media', None) and getattr(msg.media, 'pk', None):
+                            pk = msg.media.pk
+                    elif msg.item_type == 'text':
+                        match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/([a-zA-Z0-9_-]+)', text)
+                        if match:
+                            pk = cl.media_pk_from_code(match.group(1))
+
+                    if pk:
+                        print(f"Found media PK: {pk}")
                         if process_video(cl, pk, msg.id, history):
                             found = True
                             break
-                            
-                    # الحالة 2: مشاركة ريلز مباشرة (كائن وسائط)
-                    elif msg.item_type in ('media_share', 'clip', 'xma_clip'):
-                        media = getattr(msg, 'media', None) or getattr(msg, 'clip', None)
-                        if media and hasattr(media, 'pk'):
-                            if process_video(cl, media.pk, msg.id, history):
-                                found = True
-                                break
                 if found: break
             
             if not found:
