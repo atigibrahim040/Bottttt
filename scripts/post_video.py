@@ -25,20 +25,16 @@ def load_client():
     cl.expose = lambda *args, **kwargs: True
     return cl
 
-def process_video(cl, target_url, msg_id, history):
-    print(f"Found new link: {target_url}")
-    ti = Path(tempfile.mktemp(suffix=".mp4"))
-    to = Path(tempfile.mktemp(suffix=".mp4"))
-    thumb = Path(tempfile.mktemp(suffix=".jpg"))
-    
+def process_video(cl, media_pk, msg_id, history):
+    print(f"Processing media_pk: {media_pk}")
+    ti, to, thumb = Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".jpg"))
     try:
-        print("Downloading high quality video...")
-        media_pk = cl.media_pk_from_url(target_url)
         media = cl.media_info(media_pk)
         if not media.video_url:
-            print("Not a video link.")
+            print("Not a video, skipping.")
             return False
             
+        print("Downloading high quality video...")
         with requests.get(media.video_url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with ti.open("wb") as f:
@@ -82,31 +78,42 @@ def main():
     
     while time.time() - start_time < MAX_RUNTIME:
         try:
-            threads = cl.direct_threads(amount=10)
+            threads = cl.direct_threads(amount=5)
             found = False
             for thread in threads:
-                for msg in thread.messages:
+                # جلب آخر 5 رسائل من كل محادثة
+                messages = cl.direct_messages(thread.id, amount=5)
+                for msg in messages:
+                    if msg.id in history: continue
+                    
                     text = getattr(msg, "text", "") or ""
-                    link_obj = getattr(msg, "link", None)
-                    if link_obj and hasattr(link_obj, "text"):
-                        text += " " + (link_obj.text or "")
-                    if text:
-                        match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[a-zA-Z0-9_-]+', text)
-                        if match and msg.id not in history:
-                            target_url = match.group(0)
-                            if process_video(cl, target_url, msg.id, history):
+                    print(f"Checking msg {msg.id} | type: {msg.item_type} | text: {text[:50]}")
+                    
+                    # الحالة 1: رسالة نصية فيها رابط
+                    match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/([a-zA-Z0-9_-]+)', text)
+                    if match:
+                        pk = cl.media_pk_from_url(match.group(0))
+                        if process_video(cl, pk, msg.id, history):
+                            found = True
+                            break
+                            
+                    # الحالة 2: مشاركة ريلز مباشرة (كائن وسائط)
+                    elif msg.item_type in ('media_share', 'clip', 'xma_clip'):
+                        media = getattr(msg, 'media', None) or getattr(msg, 'clip', None)
+                        if media and hasattr(media, 'pk'):
+                            if process_video(cl, media.pk, msg.id, history):
                                 found = True
                                 break
                 if found: break
             
             if not found:
-                print("No new links. Waiting 60 seconds...")
-                time.sleep(60)
+                print("No new valid videos. Waiting 30 seconds...")
+                time.sleep(30)
                 
         except Exception as e:
             print(f"Monitor error: {e}")
-            time.sleep(60)
+            time.sleep(30)
 
-    print("Time limit reached. Exiting gracefully for next run.")
+    print("Time limit reached. Exiting gracefully.")
 
 if __name__ == "__main__": main()
