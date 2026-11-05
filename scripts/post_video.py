@@ -1,4 +1,5 @@
 import json, os, random, sys, tempfile, time, subprocess
+import imageio_ffmpeg
 from pathlib import Path
 import requests
 sys.path.insert(0, str(Path(__file__).parent))
@@ -47,10 +48,11 @@ def main():
             with ti.open("wb") as f:
                 for chunk in r.iter_content(65536): f.write(chunk)
         print("Editing with ffmpeg (flip + speed)...")
-        r1 = subprocess.run(["ffmpeg","-y","-i",str(ti),"-vf","hflip,setpts=0.95*PTS","-af","atempo=1.05","-c:v","libx264","-c:a","aac",str(to)], capture_output=True)
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        r1 = subprocess.run([ffmpeg_exe,"-y","-i",str(ti),"-vf","hflip,setpts=0.95*PTS","-af","atempo=1.05","-c:v","libx264","-c:a","aac",str(to)], capture_output=True)
         if r1.returncode != 0: sys.exit("ffmpeg edit failed: " + r1.stderr.decode()[:300])
         print("Generating thumbnail with ffmpeg...")
-        r2 = subprocess.run(["ffmpeg","-y","-i",str(to),"-ss","00:00:01.000","-vframes","1",str(thumb)], capture_output=True)
+        r2 = subprocess.run([ffmpeg_exe,"-y","-i",str(to),"-ss","00:00:01.000","-vframes","1",str(thumb)], capture_output=True)
         if r2.returncode != 0: sys.exit("ffmpeg thumb failed: " + r2.stderr.decode()[:300])
         print("Uploading (with pre-generated thumbnail)...")
         caption = getattr(selected, 'caption_text', '') or ""
