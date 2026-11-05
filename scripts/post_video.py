@@ -68,6 +68,32 @@ def process_video(cl, media_pk, msg_id, history):
         for f in (ti, to, thumb):
             if f.exists(): f.unlink()
 
+def extract_pk(msg):
+    # 1. البحث في xma_share
+    if getattr(msg, 'xma_share', None):
+        if getattr(msg.xma_share, 'video', None) and getattr(msg.xma_share.video, 'pk', None):
+            return msg.xma_share.video.pk
+        if getattr(msg.xma_share, 'media', None) and getattr(msg.xma_share.media, 'pk', None):
+            return msg.xma_share.media.pk
+
+    # 2. البحث في clip أو media
+    if getattr(msg, 'clip', None) and getattr(msg.clip, 'pk', None):
+        return msg.clip.pk
+    if getattr(msg, 'media', None) and getattr(msg.media, 'pk', None):
+        return msg.media.pk
+        
+    # 3. خطة الطوارئ: قراءة الـ JSON الخام واستخراج الـ pk
+    try:
+        raw_json = msg.model_dump_json()
+        # البحث عن أي pk يبدأ بـ 20 رقم أو أكثر (عادة أرقام الفيديوهات طويلة)
+        match = re.search(r'"pk":\s*"?(\d{15,})"?', raw_json)
+        if match:
+            return int(match.group(1))
+    except:
+        pass
+        
+    return None
+
 def main():
     cl = load_client()
     history = json.loads(HISTORY_FILE.read_text(encoding="utf-8")) if HISTORY_FILE.exists() else []
@@ -86,25 +112,21 @@ def main():
                     if msg.id in history: continue
                     
                     text = getattr(msg, "text", "") or ""
-                    print(f"Checking msg {msg.id} | type: {msg.item_type} | text: {text[:50]}")
+                    print(f"Checking msg {msg.id} | type: {msg.item_type}")
                     
-                    pk = None
-                    # استخراج الـ PK من مشاركة الريلز (xma_clip) أو الرسائل العادية
-                    if msg.item_type == 'xma_clip':
-                        if getattr(msg, 'clip', None) and getattr(msg.clip, 'pk', None):
-                            pk = msg.clip.pk
-                        elif getattr(msg, 'xma_share', None) and getattr(msg.xma_share, 'video', None):
-                            pk = msg.xma_share.video.pk
-                    elif msg.item_type == 'media_share':
-                        if getattr(msg, 'media', None) and getattr(msg.media, 'pk', None):
-                            pk = msg.media.pk
-                    elif msg.item_type == 'text':
+                    pk = extract_pk(msg)
+                    
+                    # إذا لم نجد PK، نجرب الروابط النصية
+                    if not pk and text:
                         match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/([a-zA-Z0-9_-]+)', text)
                         if match:
-                            pk = cl.media_pk_from_code(match.group(1))
+                            try:
+                                pk = cl.media_pk_from_code(match.group(1))
+                            except:
+                                pass
 
                     if pk:
-                        print(f"Found media PK: {pk}")
+                        print(f"Extracted PK: {pk}")
                         if process_video(cl, pk, msg.id, history):
                             found = True
                             break
