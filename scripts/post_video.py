@@ -1,3 +1,4 @@
+import sys
 import json, os, re, sys, tempfile, time, subprocess
 from pathlib import Path
 from urllib.parse import unquote
@@ -25,7 +26,7 @@ def git_push_history():
     run("git", "add", "data/history.json")
     run("git", "commit", "-m", "chore: update history [skip ci]")
     run("git", "pull", "--rebase", "--autostash")
-    print("push:", run("git", "push").returncode)
+    print("push:", run("git", "push").returncode, flush=True)
 
 def load_client():
     cl = Client()
@@ -87,7 +88,7 @@ def resolve_pk(cl, item):
             if info.media_type == 2 or info.product_type == "clips":
                 return pk, info, None
         except Exception as e:
-            print(f"  pk {pk} invalid: {str(e)[:80]}")
+            print(f"  pk {pk} invalid: {str(e)[:80]}", flush=True)
     if vids:
         return None, None, vids[0]
     return None, None, None
@@ -96,9 +97,9 @@ def download(cl, pk, direct_url, folder):
     if pk:
         try: return Path(cl.clip_download(pk, folder=folder))
         except Exception as e:
-            print("clip_download failed:", str(e)[:100])
+            print("clip_download failed:", str(e)[:100], flush=True)
             try: return Path(cl.video_download(pk, folder=folder))
-            except Exception as e2: print("video_download failed:", str(e2)[:100])
+            except Exception as e2: print("video_download failed:", str(e2)[:100], flush=True)
     url = direct_url or (str(cl.media_info(pk).video_url) if pk else None)
     if not url: return None
     p = folder / f"dl_{int(time.time())}.mp4"
@@ -114,14 +115,14 @@ def download_and_post(cl, pk, info, direct_url, msg_id, history):
     try:
         src = download(cl, pk, direct_url, tmp)
         if not src or not src.exists():
-            print("download failed"); return False
+            print("download failed", flush=True); return False
         out, thumb = tmp / "out.mp4", tmp / "thumb.jpg"
         r = subprocess.run([FFMPEG, "-y", "-i", str(src), "-vf", "hflip",
                             "-c:v", "libx264", "-crf", "18", "-preset", "fast",
                             "-c:a", "copy", "-movflags", "+faststart", str(out)],
                            capture_output=True)
         if r.returncode != 0:
-            print("ffmpeg failed:", r.stderr[-300:].decode(errors="ignore")); return False
+            print("ffmpeg failed:", r.stderr[-300:].decode(errors="ignore"), flush=True); return False
         subprocess.run([FFMPEG, "-y", "-i", str(out), "-ss", "1", "-vframes", "1", str(thumb)],
                        capture_output=True)
         caption = (getattr(info, "caption_text", "") or "") if info else ""
@@ -130,13 +131,13 @@ def download_and_post(cl, pk, info, direct_url, msg_id, history):
                            thumbnail=str(thumb) if thumb.exists() else None)
         except pydantic.ValidationError:
             pass
-        print("POSTED SUCCESSFULLY")
+        print("POSTED SUCCESSFULLY", flush=True)
         history.append(msg_id)
         HISTORY_FILE.write_text(json.dumps(history, indent=2))
         git_push_history()
         return True
     except Exception as e:
-        print("Error:", e); return False
+        print("Error:", e, flush=True); return False
     finally:
         for f in tmp.glob("*"):
             try: f.unlink()
@@ -147,7 +148,7 @@ def main():
     my_id = str(cl.user_id)
     history = json.loads(HISTORY_FILE.read_text(encoding="utf-8")) if HISTORY_FILE.exists() else []
     start = time.time()
-    print(f"Monitoring for {MAX_RUNTIME/3600} hours...")
+    print(f"Monitoring for {MAX_RUNTIME/3600} hours...", flush=True)
     while time.time() - start < MAX_RUNTIME:
         try:
             posted = False
@@ -164,26 +165,26 @@ def main():
                         skipped.add(mid); continue
                     t = item.get("item_type")
                     if t in ("text", "action_log", "placeholder", "voice_media", "like"): continue
-                    print(f"Checking {mid} | type: {t}")
-                    print("  RAW:", json.dumps(shorten(item), ensure_ascii=False)[:2500])
+                    print(f"Checking {mid} | type: {t}", flush=True)
+                    print("  RAW:", json.dumps(shorten(item), ensure_ascii=False)[:2500], flush=True)
                     pk, info, direct = resolve_pk(cl, item)
                     if not pk and not direct:
-                        print("  could not extract video; skipping"); skipped.add(mid); continue
+                        print("  could not extract video; skipping"); skipped.add(mid, flush=True); continue
                     if download_and_post(cl, pk, info, direct, mid, history):
                         posted = True; break
                     skipped.add(mid)
                 if posted: break
             if not posted:
-                print("No new valid videos. Waiting 10 seconds...")
+                print("No new valid videos. Waiting 10 seconds...", flush=True)
             time.sleep(180)
         except Exception as e:
             if "Challenge" in type(e).__name__ or "Challenge" in str(e):
-                print("CHALLENGE DETECTED! Stopping to protect account.")
-                print(str(e)[:300])
+                print("CHALLENGE DETECTED! Stopping to protect account.", flush=True)
+                print(str(e)[:300], flush=True)
                 sys.exit(1)
-            print(f"Monitor error: {e}")
+            print(f"Monitor error: {e}", flush=True)
             time.sleep(30)
-    print("Time limit reached.")
+    print("Time limit reached.", flush=True)
 
 if __name__ == "__main__":
     main()

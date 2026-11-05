@@ -27,5 +27,5 @@ jobs:
       - name: Monitor DMs and Post
         env:
           SESSION_PASSWORD: ${{ secrets.SESSION_PASSWORD }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/post_video.py
+          PYTHONUNBUFFERED: "1"
+        run: python -u scripts/post_video.py
