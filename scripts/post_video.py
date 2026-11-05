@@ -175,7 +175,7 @@ def main():
                 if posted: break
             if not posted:
                 print("No new valid videos. Waiting 10 seconds...")
-            time.sleep(10)
+            time.sleep(180)
         except Exception as e:
             if "Challenge" in type(e).__name__ or "Challenge" in str(e):
                 print("CHALLENGE DETECTED! Stopping to protect account.")
