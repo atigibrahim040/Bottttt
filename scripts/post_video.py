@@ -26,21 +26,28 @@ def main():
     history = json.loads(HISTORY_FILE.read_text(encoding="utf-8")) if HISTORY_FILE.exists() else []
     random.shuffle(sources)
     selected = None
+    
+    keywords = ["قرآن", "قران", "سورة", "تلاوة", "quran", "surah", "اية", "آية", "اسلام", "إسلام", "الله"]
+    
     print("Searching for a new Quran clip...")
     for source in sources:
         try:
             uid = cl.user_id_from_username(source)
-            time.sleep(3)
-            for c in cl.user_clips(uid, amount=5):
+            time.sleep(5)
+            for c in cl.user_clips(uid, amount=8):
+                c_text = (getattr(c, 'caption_text', '') or '').lower()
                 if c.pk not in history and getattr(c, 'video_url', None):
-                    selected = c
-                    break
+                    if any(k in c_text for k in keywords):
+                        selected = c
+                        break
             if selected: break
         except Exception as e:
             print(f"Error {source}: {e}")
-            time.sleep(5)
-    if not selected: sys.exit("No new clips found.")
+            time.sleep(10)
+            
+    if not selected: sys.exit("No new Quran clips found in recent posts.")
     print(f"Selected: {selected.pk} from @{selected.user.username}")
+    
     ti, to, thumb = Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".mp4")), Path(tempfile.mktemp(suffix=".jpg"))
     try:
         print("Downloading...")
@@ -48,20 +55,26 @@ def main():
             r.raise_for_status()
             with ti.open("wb") as f:
                 for chunk in r.iter_content(65536): f.write(chunk)
-        print("Editing with ffmpeg (flip + speed)...")
+                
+        print("Editing with ffmpeg (flip to avoid duplicate detection)...")
         import imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        r1 = subprocess.run([ffmpeg_exe, "-y", "-i", str(ti), "-vf", "hflip,setpts=0.95*PTS", "-af", "atempo=1.05", "-c:v", "libx264", "-c:a", "aac", str(to)], capture_output=True)
+        
+        # نعكس الفيديو فقط للحفاظ على الصوت الأصلي كما هو
+        r1 = subprocess.run([ffmpeg_exe, "-y", "-i", str(ti), "-vf", "hflip", "-c:v", "libx264", "-c:a", "copy", str(to)], capture_output=True)
         if r1.returncode != 0: sys.exit("ffmpeg edit failed: " + r1.stderr.decode()[:300])
+        
         print("Generating thumbnail with ffmpeg...")
         r2 = subprocess.run([ffmpeg_exe, "-y", "-i", str(to), "-ss", "00:00:01.000", "-vframes", "1", str(thumb)], capture_output=True)
         if r2.returncode != 0: sys.exit("ffmpeg thumb failed: " + r2.stderr.decode()[:300])
-        print("Uploading (with pre-generated thumbnail)...")
+        
+        print("Uploading...")
         caption = getattr(selected, 'caption_text', '') or ""
         try:
             cl.clip_upload(str(to), caption + "\n\n" + HASHTAGS, thumbnail=str(thumb))
-        except pydantic.ValidationError as e:
-            print(f"Upload succeeded, ignoring response parsing error.")
+        except pydantic.ValidationError:
+            pass 
+            
         print("POSTED SUCCESSFULLY")
         history.append(selected.pk)
         HISTORY_FILE.write_text(json.dumps(history, indent=2))
