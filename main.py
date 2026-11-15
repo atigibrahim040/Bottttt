@@ -1,430 +1,246 @@
 # -*- coding: utf-8 -*-
+"""
+Telegram Auto-Listener for GitHub Actions
+- Listens to channels/groups for @FAABOT codes and referral links
+- Handles private bot replies (join channels / click inline buttons)
+- Human-like delays (7-10s), never crashes, max runtime 350 minutes
+"""
+
+import os
+import re
+import random
 import asyncio
 import logging
-import os
-import random
-import re
-import sys
-import time
-from collections import defaultdict, deque
-from urllib.parse import parse_qs, urlparse
 
-from telethon import TelegramClient, events
-from telethon.errors import (
-    AuthKeyDuplicatedError,
-    AuthKeyUnregisteredError,
-    FloodWaitError,
-    SessionRevokedError,
-    UserAlreadyParticipantError,
-)
+from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
 
-# ───────────────────────── Logging ─────────────────────────
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logging.getLogger("telethon").setLevel(logging.WARNING)
-log = logging.getLogger("listener")
+log = logging.getLogger("telegram-automation")
 
-# ───────────────────────── Config ─────────────────────────
-def env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        log.critical("Missing environment variable: %s", name)
-        sys.exit(1)
-    return value
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+API_ID = int(os.environ["TELEGRAM_API_ID"])
+API_HASH = os.environ["TELEGRAM_API_HASH"]
+SESSION = os.environ["TELEGRAM_SESSION"]
 
+MAX_RUNTIME_SECONDS = 350 * 60  # 350 minutes hard limit
 
-try:
-    API_ID = int(env("TELEGRAM_API_ID"))
-except ValueError:
-    log.critical("TELEGRAM_API_ID must be an integer")
-    sys.exit(1)
-API_HASH = env("TELEGRAM_API_HASH")
-SESSION = env("TELEGRAM_SESSION")
-
-RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "350"))
 FAABOT_USERNAME = "FAABOT"
-CODE_PROMPT_TIMEOUT = 120          # seconds to wait for the "send the code" prompt
-MAX_START_RETRIES = 2              # re-send /start after joining channels
-JOIN_PER_MESSAGE_LIMIT = 5
 
-BUTTON_KEYWORDS = ("تحقق", "التحقق", "استخدام كود", "استلام")
-JOIN_KEYWORDS = ("اشترك", "اشتراك", "مشترك", "قناة", "القناة")
+# Keywords for clicking inline buttons in private bot replies
+BUTTON_KEYWORDS = ["تحقق", "التحقق", "استخدام كود", "استلام"]
 
-BIDI_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c]")
-URL_RE = re.compile(
-    r"(?<![A-Za-z0-9_.@])(?:https?://)?(?:www\.)?(?:t|telegram)\.(?:me|dog)/[^\s<>\"'()\[\]]+",
-    re.I,
-)
-MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})")
-CODE_PROMPT_RE = re.compile(r"[اأإ]رسل\s+(?:ال)?كود")
-USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
-PAYLOAD_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")
-TME_HOSTS = {"t.me", "www.t.me", "telegram.me", "telegram.dog"}
-RESERVED_PATHS = {
-    "joinchat", "addstickers", "addemoji", "addtheme", "addlist", "share", "proxy",
-    "socks", "c", "s", "iv", "setlanguage", "login", "confirmphone", "invoice",
-    "giftcode", "m", "boost", "contact",
-}
+# Keywords that indicate a mandatory channel subscription request
+SUBSCRIBE_KEYWORDS = ["اشترك", "قناة"]
 
-CODE_PATTERNS = [
-    re.compile(r"كود\s*[:：]\s*([A-Za-z0-9]{2,20})(?![A-Za-z0-9])"),
-    re.compile(r"الكود\s+([A-Za-z0-9]{2,20})(?![A-Za-z0-9])"),
-    re.compile(r"[:：]\s*([A-Za-z0-9]{3,20})(?![A-Za-z0-9])"),
-]
+# ---------------------------------------------------------------------------
+# Regexes
+# ---------------------------------------------------------------------------
+# Matches: "الكود : LJYS" / "الكود: JOTL" / "الكود 7DD"
+CODE_REGEX = re.compile(r"الكود\s*[:：]?\s*([A-Za-z0-9]+)")
 
-# ───────────────────────── State ─────────────────────────
-client = TelegramClient(
-    StringSession(SESSION),
-    API_ID,
-    API_HASH,
-    connection_retries=10,
-    retry_delay=5,
-    auto_reconnect=True,
-    request_retries=5,
+# Matches: https://t.me/BOTNAME?start=PAYLOAD
+REFERRAL_REGEX = re.compile(
+    r"https?://t\.me/([A-Za-z0-9_]{3,64})\?start=([A-Za-z0-9_\-]+)"
 )
 
-action_lock = asyncio.Lock()      # one action at a time, 7-10s apart
-faabot_lock = asyncio.Lock()      # one FAABOT flow at a time
-code_prompt = asyncio.Event()     # set when FAABOT asks for the code
+# Matches any t.me link that is NOT a bot (possible channel/group link)
+CHANNEL_LINK_REGEX = re.compile(r"https?://t\.me/([A-Za-z0-9_]{3,64})")
 
-seen_codes = set()
-seen_links = set()
-attempted_joins = set()
-clicked_buttons = set()
-last_start = {}                   # bot username(lower) -> last /start text
-retry_counts = defaultdict(int)
-click_times = defaultdict(deque)
-background = set()
+# A very rough heuristic: bot usernames often end with 'bot'
+BOT_SUFFIX_REGEX = re.compile(r"bot$", re.IGNORECASE)
 
 
-# ───────────────────────── Helpers ─────────────────────────
-def clean(text) -> str:
-    return BIDI_RE.sub("", text or "")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def human_delay() -> float:
+    """Human-like delay between 7 and 10 seconds."""
+    return random.uniform(7.0, 10.0)
 
 
-async def human_delay():
-    await asyncio.sleep(random.uniform(7.0, 10.0))
-
-
-def spawn(coro):
-    task = asyncio.create_task(coro)
-    background.add(task)
-    task.add_done_callback(background.discard)
-    return task
-
-
-async def safe(name, coro):
+async def smart_delay():
     try:
-        await coro
-    except Exception:
-        log.exception("Unhandled error in task '%s'", name)
+        await asyncio.sleep(human_delay())
+    except Exception as e:
+        log.warning("Delay interrupted: %s", e)
 
 
-def rate_ok(key, limit=8, window=600):
-    now = time.monotonic()
-    dq = click_times[key]
-    while dq and now - dq[0] > window:
-        dq.popleft()
-    if len(dq) >= limit:
+async def safe_send(client: TelegramClient, target, text: str, what: str = "message"):
+    """Send a message safely, resolving username inline without crashing."""
+    try:
+        await client.send_message(target, text)
+        log.info("[SEND %s] -> %s : %r", what, target, text)
+        return True
+    except Exception as e:
+        log.error("[SEND FAIL %s] target=%r text=%r error=%s", what, target, text, e)
         return False
-    dq.append(now)
-    return True
 
 
-async def step(label, func, *args, **kwargs):
-    """Run one action with a human delay before it. Never raises."""
-    async with action_lock:
-        await human_delay()
-        try:
-            log.info("▶ %s", label)
-            return True, await func(*args, **kwargs)
-        except FloodWaitError as e:
-            wait = min(e.seconds + 2, 900)
-            log.warning("FloodWait %ss on '%s'", e.seconds, label)
-            await asyncio.sleep(wait)
-        except Exception as e:
-            log.error("✖ '%s' failed: %s: %s", label, type(e).__name__, e)
-        return False, None
-
-
-async def send_to_bot(username: str, text: str) -> bool:
-    username = username.lstrip("@")
-    ok, _ = await step(f"send {text!r} -> @{username}", client.send_message, username, text)
-    return ok
-
-
-async def join_target(kind: str, value: str):
+# ---------------------------------------------------------------------------
+# Handler 1: Channels / Groups — FAABOT codes + referral links
+# ---------------------------------------------------------------------------
+async def handle_public_message(event, client: TelegramClient):
     try:
-        if kind == "invite":
-            await client(ImportChatInviteRequest(value))
-        else:
-            await client(JoinChannelRequest(value))
-    except UserAlreadyParticipantError:
-        log.info("Already a member: %s", value)
-
-
-def extract_code(text: str):
-    for pat in CODE_PATTERNS:
-        m = pat.search(text)
-        if m:
-            return m.group(1)
-    return None
-
-
-def iter_buttons(msg):
-    try:
-        rows = msg.buttons or []
-    except Exception:
-        return
-    for x, row in enumerate(rows):
-        for y, btn in enumerate(row):
-            yield x, y, btn
-
-
-def collect_urls(msg):
-    urls = []
-    try:
-        text = clean(msg.raw_text or "")
-        urls += [u.rstrip(".,;:!?،؛") for u in URL_RE.findall(text)]
-        for ent in msg.entities or []:
-            u = getattr(ent, "url", None)
-            if u:
-                urls.append(u)
-        for _, _, btn in iter_buttons(msg):
-            u = getattr(btn, "url", None)
-            if u:
-                urls.append(u)
-    except Exception:
-        log.exception("collect_urls failed")
-    return list(dict.fromkeys(urls))
-
-
-def parse_tme(url: str):
-    """Returns (kind, a, b): ('start', bot, payload) | ('invite', hash, None) | ('public', username, None)."""
-    try:
-        url = url.strip().rstrip(".,;:!?،؛)")
-        if not re.match(r"https?://", url, re.I):
-            url = "https://" + url
-        u = urlparse(url)
-        if (u.hostname or "").lower() not in TME_HOSTS:
-            return None
-        parts = [p for p in u.path.split("/") if p]
-        if not parts:
-            return None
-        first = parts[0]
-        query = parse_qs(u.query)
-
-        if "start" in query:
-            if len(parts) == 1 and USERNAME_RE.fullmatch(first):
-                payload = query["start"][0]
-                if PAYLOAD_RE.fullmatch(payload):
-                    return ("start", first, payload)
-            return None
-
-        if first.startswith("+") and len(first) > 1:
-            return ("invite", first[1:], None)
-        if first.lower() == "joinchat" and len(parts) > 1:
-            return ("invite", parts[1], None)
-        if (
-            USERNAME_RE.fullmatch(first)
-            and first.lower() not in RESERVED_PATHS
-            and not first.lower().endswith("bot")
-        ):
-            return ("public", first, None)
-    except Exception:
-        log.exception("parse_tme failed for %r", url)
-    return None
-
-
-# ───────────────────────── Flows ─────────────────────────
-async def run_faabot_flow(code: str):
-    async with faabot_lock:
-        last_start[FAABOT_USERNAME.lower()] = "/start"
-        retry_counts[FAABOT_USERNAME.lower()] = 0
-        code_prompt.clear()
-        if not await send_to_bot(FAABOT_USERNAME, "/start"):
+        text = event.raw_text or ""
+        if not text:
             return
-        try:
-            await asyncio.wait_for(code_prompt.wait(), CODE_PROMPT_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.warning("No code prompt from FAABOT, sending code anyway")
-        await send_to_bot(FAABOT_USERNAME, code)
-        log.info("FAABOT code sent: %s", code)
 
+        # --- 1) FAABOT code flow ---
+        if ("FAABOT@" in text) or ("@FAABOT" in text):
+            code_match = CODE_REGEX.search(text)
+            if code_match:
+                code = code_match.group(1)
+                log.info("[FAABOT] Found code: %s", code)
 
-async def run_referral_flow(bot: str, payload: str):
-    text = f"/start {payload}"
-    last_start[bot.lower()] = text
-    retry_counts[bot.lower()] = 0
-    await send_to_bot(bot, text)
+                # Step 1: /start
+                await smart_delay()
+                ok = await safe_send(client, FAABOT_USERNAME, "/start", "faabot-start")
+                if not ok:
+                    return
 
-
-async def process_public(event):
-    msg = event.message
-    text = clean(event.raw_text)
-
-    if "faabot" in text.lower():
-        code = extract_code(text)
-        if code:
-            if code.upper() in seen_codes:
-                log.info("Code %s already handled, skipping", code)
+                # Step 2: the extracted code
+                await smart_delay()
+                await safe_send(client, FAABOT_USERNAME, code, "faabot-code")
             else:
-                seen_codes.add(code.upper())
-                log.info("FAABOT code found: %s", code)
-                spawn(safe("faabot", run_faabot_flow(code)))
-        else:
-            log.info("FAABOT mentioned but no code found")
+                log.info("[FAABOT] Mentioned but no code found in message.")
 
-    for url in collect_urls(msg):
-        info = parse_tme(url)
-        if not info or info[0] != "start":
-            continue
-        _, bot, payload = info
-        key = (bot.lower(), payload)
-        if key in seen_links:
-            continue
-        seen_links.add(key)
-        log.info("Referral link found: @%s ?start=%s", bot, payload)
-        spawn(safe("referral", run_referral_flow(bot, payload)))
+        # --- 2) Referral links (?start=) ---
+        for username, payload in REFERRAL_REGEX.findall(text):
+            log.info("[REFERRAL] bot=%s payload=%s", username, payload)
+            await smart_delay()
+            await safe_send(client, username, f"/start {payload}", "referral")
+
+    except Exception as e:
+        log.error("[PUBLIC HANDLER ERROR] %s", e, exc_info=True)
 
 
-async def process_private(event):
-    sender = await event.get_sender()
-    if sender is None or not getattr(sender, "bot", False):
-        return
-
-    msg = event.message
-    bot_key = (getattr(sender, "username", None) or str(sender.id)).lower()
-    text = clean(event.raw_text)
-
-    if bot_key == FAABOT_USERNAME.lower() and CODE_PROMPT_RE.search(text):
-        code_prompt.set()
-
-    labels = [clean(btn.text or "") for _, _, btn in iter_buttons(msg)]
-    haystack = text + " " + " ".join(labels)
-    wants_join = any(k in haystack for k in JOIN_KEYWORDS)
-
-    # ── 1) forced subscription ──
-    targets = []
-    for url in collect_urls(msg):
-        info = parse_tme(url)
-        if info and info[0] in ("invite", "public"):
-            targets.append((info[0], info[1]))
-    if wants_join:
-        for name in MENTION_RE.findall(text):
-            if not name.lower().endswith("bot"):
-                targets.append(("public", name))
-    targets = list(dict.fromkeys(targets))[:JOIN_PER_MESSAGE_LIMIT]
-
-    joined_any = False
-    for kind, value in targets:
-        key = f"{kind}:{value}".lower()
-        if key in attempted_joins:
-            continue
-        attempted_joins.add(key)
-        ok, _ = await step(f"join {kind} {value}", join_target, kind, value)
-        joined_any = joined_any or ok
-
-    # ── 2) inline buttons ──
-    clicked = False
-    for x, y, btn in iter_buttons(msg):
-        label = clean(btn.text or "")
-        if not any(k in label for k in BUTTON_KEYWORDS):
-            continue
-        if getattr(btn, "url", None) or getattr(btn, "data", None) is None:
-            continue  # URL buttons / non-callback buttons can't be "clicked"
-        mkey = (bot_key, msg.id, x, y)
-        if mkey in clicked_buttons:
-            continue
-        clicked_buttons.add(mkey)
-        if not rate_ok(f"click:{bot_key}"):
-            log.warning("Click rate limit reached for @%s", bot_key)
-            continue
-        ok, _ = await step(f"click '{label}' @{bot_key}", msg.buttons[x][y].click)
-        clicked = clicked or ok
-
-    # ── 3) after joining, retry /start (bounded) ──
-    if joined_any and not clicked:
-        last = last_start.get(bot_key)
-        if last and retry_counts[bot_key] < MAX_START_RETRIES:
-            retry_counts[bot_key] += 1
-            await send_to_bot(bot_key, last)
-
-
-# ───────────────────────── Handlers ─────────────────────────
-@client.on(events.NewMessage(incoming=True, func=lambda e: not e.is_private))
-async def on_public(event):
+# ---------------------------------------------------------------------------
+# Handler 2: Private messages from bots — join channels + click buttons
+# ---------------------------------------------------------------------------
+async def handle_private_message(event, client: TelegramClient):
     try:
-        if event.out:
+        sender = await event.get_sender()
+        # Only react to bots in private chats
+        if not getattr(sender, "bot", False):
             return
-        spawn(safe("public", process_public(event)))
-    except Exception:
-        log.exception("on_public failed")
 
+        text = event.raw_text or ""
 
-@client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-async def on_private(event):
-    try:
-        if event.out:
-            return
-        spawn(safe("private", process_private(event)))
-    except Exception:
-        log.exception("on_private failed")
+        # --- 1) Mandatory subscription: join channels mentioned in text ---
+        needs_join = any(kw in text for kw in SUBSCRIBE_KEYWORDS)
+        if needs_join:
+            for username in CHANNEL_LINK_REGEX.findall(text):
+                # Skip obvious bot links (bots can't be joined as channels anyway)
+                if BOT_SUFFIX_REGEX.search(username):
+                    continue
+                try:
+                    log.info("[JOIN] Attempting to join @%s", username)
+                    await smart_delay()
+                    await client(functions.channels.JoinChannelRequest(channel=username))
+                    log.info("[JOIN] Successfully joined @%s", username)
+                except Exception as e:
+                    log.error("[JOIN FAIL] @%s error=%s", username, e)
 
-
-# ───────────────────────── Main ─────────────────────────
-async def main() -> int:
-    deadline = time.monotonic() + RUN_MINUTES * 60
-    authorized = False
-
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            log.info("Time limit reached (%d min)", RUN_MINUTES)
-            break
+        # --- 2) Click inline buttons with target keywords ---
         try:
-            await client.connect()
-            if not authorized:
-                if not await client.is_user_authorized():
-                    log.critical("Session is not authorized. Regenerate TELEGRAM_SESSION.")
-                    return 1
-                me = await client.get_me()
-                log.info("Logged in as %s (id=%s). Listening for %d min...",
-                         getattr(me, "first_name", "?"), me.id, RUN_MINUTES)
-                authorized = True
-            await asyncio.wait_for(client.run_until_disconnected(), timeout=remaining)
-            log.warning("Disconnected, reconnecting...")
-            await asyncio.sleep(5)
-        except asyncio.TimeoutError:
-            if time.monotonic() >= deadline - 1:
-                log.info("Time limit reached (%d min)", RUN_MINUTES)
-                break
-            log.warning("Timeout, retrying...")
-            await asyncio.sleep(5)
-        except (AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError) as e:
-            log.critical("Session invalid (%s). Regenerate TELEGRAM_SESSION.", type(e).__name__)
-            return 1
+            button_rows = event.message.buttons
         except Exception:
-            log.exception("Main loop error, retrying in 10s")
-            await asyncio.sleep(10)
+            button_rows = None
 
-    for task in list(background):
-        task.cancel()
+        if button_rows:
+            for row in button_rows:
+                if not row:
+                    continue
+                for button in row:
+                    try:
+                        btn_text = (button.text or "")
+                    except Exception:
+                        btn_text = ""
+                    if any(kw in btn_text for kw in BUTTON_KEYWORDS):
+                        try:
+                            log.info("[BUTTON] Clicking: %r", btn_text)
+                            await smart_delay()
+                            await button.click()
+                            log.info("[BUTTON] Clicked: %r", btn_text)
+                        except Exception as e:
+                            log.error("[BUTTON FAIL] %r error=%s", btn_text, e)
+
+    except Exception as e:
+        log.error("[PRIVATE HANDLER ERROR] %s", e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+async def main():
+    log.info("Starting Telegram automation client...")
+
+    client = TelegramClient(
+        StringSession(SESSION),
+        API_ID,
+        API_HASH,
+        # Connection tuning for CI environments
+        connection_retries=None,
+        retry_delay=2,
+        auto_reconnect=True,
+        request_retries=10,
+    )
+
+    await client.start()
+    me = await client.get_me()
+    log.info("Logged in as: %s (id=%s)", getattr(me, "username", None), me.id)
+
+    # --- Event: new messages everywhere (incoming only) ---
+    @client.on(events.NewMessage(incoming=True))
+    async def _on_message(event):
+        try:
+            # Ignore messages sent by the account itself (safety vs loops)
+            if event.out:
+                return
+
+            if event.is_private:
+                await handle_private_message(event, client)
+            else:
+                await handle_public_message(event, client)
+        except Exception as e:
+            log.error("[EVENT LOOP ERROR] %s", e, exc_info=True)
+
+    log.info("Client is listening (max runtime: %d minutes)...",
+             MAX_RUNTIME_SECONDS // 60)
+
     try:
-        await client.disconnect()
-    except Exception:
-        pass
-    return 0
+        await asyncio.wait_for(
+            client.run_until_disconnected(),
+            timeout=MAX_RUNTIME_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        log.info("Maximum runtime (%d minutes) reached. Shutting down gracefully.",
+                 MAX_RUNTIME_SECONDS // 60)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    log.info("Done.")
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        pass
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Interrupted by user/system.")
+    except Exception as e:
+        log.error("FATAL (unexpected): %s", e, exc_info=True)
+        # Exit cleanly so the workflow can restart/logs stay readable
+        raise SystemExit(1)
