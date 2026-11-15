@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import asyncio
 import random
 import logging
@@ -9,14 +10,20 @@ from telethon.tl.functions.channels import JoinChannelRequest
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-API_ID = int(os.environ["TELEGRAM_API_ID"])
-API_HASH = os.environ["TELEGRAM_API_HASH"]
-SESSION = os.environ["TELEGRAM_SESSION"]
+env_api_id = os.environ.get("TELEGRAM_API_ID", "").strip()
+env_api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
+env_session = os.environ.get("TELEGRAM_SESSION", "").strip()
 
-# أسماء القنوات التي تنشر الأكواد والروابط
-SOURCE_CHANNELS = ['@TALABATKOM_Channel', '@AsiacellFunding_Channel'] # يرجى تعديلها بأسماء القنوات الحقيقية
-# البوتات المستهدفة
-TARGET_BOTS = ['@FAABOT', '@yynnurybot']
+if not env_api_id or not env_api_hash or not env_session:
+    logging.error("CRITICAL ERROR: Missing environment variables.")
+    sys.exit(1)
+
+API_ID = int(env_api_id)
+API_HASH = env_api_hash
+SESSION = env_session
+
+TALABATI_BOT = '@FAABOT'
+FUNDING_BOT = '@yynnurybot'
 
 async def human_delay():
     delay = random.uniform(7.0, 10.0)
@@ -25,53 +32,53 @@ async def human_delay():
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
-@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
-async def channel_listener(event):
-    text = event.message.text
+@client.on(events.NewMessage(incoming=True))
+async def global_listener(event):
+    text = event.message.text or ""
     if not text:
         return
-    
-    logging.info(f"New message detected: {text[:80]}...")
 
-    # 1. صيد صيغة FAABOT@ 7DD (كما في الصورة 7)
-    faabot_codes = re.findall(r'FAABOT@\s*([a-zA-Z0-9]{3,10})', text)
-    for code in faabot_codes:
-        try:
-            logging.info(f"Found FAABOT code: {code}. Sending to @FAABOT...")
-            await client.send_message('@FAABOT', '/start')
-            await human_delay()
-            await client.send_message('@FAABOT', code)
-            await human_delay()
-        except Exception as e:
-            logging.error(f"Error sending FAABOT code: {e}")
+    # 1. بوت طلباتي @FAABOT (الكود ديناميكي يتغير دائماً)
+    if '@FAABOT' in text or 'FAABOT@' in text:
+        code = None
+        # البحث عن الكود بعد كلمة "الكود" أو "كود" (يدعم 7DD, YERY, 514, 784...)
+        match_ar = re.search(r'(?:الكود|كود)\s*[:|]?\s*([a-zA-Z0-9]+)', text)
+        if match_ar:
+            code = match_ar.group(1)
+        else:
+            # البحث عن الكود بعد @FAABOT مباشرة
+            match_en = re.search(r'(?:FAABOT@|@FAABOT)\s*([a-zA-Z0-9]+)', text)
+            if match_en:
+                code = match_en.group(1)
 
-    # 2. صيد روابط yynnurybot (كما في الصور 3 و 4)
+        if code:
+            try:
+                logging.info(f"Found dynamic FAABOT code: {code}. Sending /start...")
+                await client.send_message(TALABATI_BOT, '/start')
+                await human_delay()
+                
+                logging.info(f"Sending dynamic code: {code} to {TALABATI_BOT}")
+                await client.send_message(TALABATI_BOT, code)
+                await human_delay()
+            except Exception as e:
+                logging.error(f"Error sending FAABOT code: {e}")
+
+    # 2. صيد روابط تمويل yynnurybot
     referral_links = re.findall(r'https://t\.me/yynnurybot\?start=([a-zA-Z0-9_\-]+)', text)
     for payload in referral_links:
         try:
             logging.info(f"Found yynnurybot referral payload: {payload}. Sending /start...")
-            await client.send_message('@yynnurybot', f'/start {payload}')
+            await client.send_message(FUNDING_BOT, f'/start {payload}')
             await human_delay()
         except Exception as e:
-            logging.error(f"Error sending yynnurybot payload: {e}")
+            logging.error(f"Error sending funding payload: {e}")
 
-    # 3. صيد الأكواد العادية (مثل LIDNU)
-    plain_codes = re.findall(r'^(?:الكود\s*[:|]?\s*)([A-Z0-9]{3,10})$', text, re.MULTILINE)
-    for p_code in plain_codes:
-        try:
-            logging.info(f"Found plain code: {p_code}. Sending to @FAABOT...")
-            await client.send_message('@FAABOT', p_code)
-            await human_delay()
-        except Exception as e:
-            logging.error(f"Error sending plain code: {e}")
-
-
-@client.on(events.NewMessage(from_users=TARGET_BOTS))
+@client.on(events.NewMessage(from_users=[TALABATI_BOT, FUNDING_BOT]))
 async def bot_listener(event):
     text = event.message.text or ""
     logging.info(f"Received reply from bot: {text[:80]}...")
 
-    # 1. التعامل مع الاشتراك الإجباري (صورة 2)
+    # 1. الاشتراك الإجباري
     if "اشترك" in text or "عليك الاشتراك" in text:
         links = re.findall(r'https://t\.me/[a-zA-Z0-9_]+', text)
         if links:
@@ -82,12 +89,12 @@ async def bot_listener(event):
             except Exception as e:
                 logging.error(f"Error joining channel: {e}")
 
-    # 2. الضغط التلقائي على الأزرار (استخدام كود، تحقق من الاشتراك، رجوع)
+    # 2. الضغط على الأزرار (استخدام كود، تحقق)
     if event.message.buttons:
         for row in event.message.buttons:
             for btn in row:
                 btn_text = btn.text
-                if any(keyword in btn_text for keyword in ["تحقق", "التحقق", "استخدام كود", "تجميع نقاط"]):
+                if any(keyword in btn_text for keyword in ["تحقق", "التحقق", "استخدام كود"]):
                     try:
                         logging.info(f"Clicking button: {btn_text}")
                         await btn.click()
@@ -98,7 +105,7 @@ async def bot_listener(event):
 async def main():
     logging.info("Starting Advanced Telegram Automation Script...")
     await client.start()
-    logging.info("Client started successfully. Listening for target formats...")
+    logging.info("Client started successfully. Listening for DYNAMIC codes...")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
