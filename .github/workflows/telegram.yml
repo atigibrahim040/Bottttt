@@ -1,34 +1,36 @@
-name: Telegram Listener
+name: Telegram Automation
 
 on:
-  workflow_dispatch:
   schedule:
+    # Runs every 6 hours (free tier limit is ~20 days/month for 6h jobs on private repos)
     - cron: "0 */6 * * *"
+  workflow_dispatch: {}   # allows manual trigger
 
-# مهم: نفس الـ session ما ينفع يشتغل مرتين بنفس الوقت (يتعطّل الـ session)
-concurrency:
-  group: telegram-listener
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 jobs:
-  listen:
+  run-listener:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 355   # slightly above script's 350 min internal limit
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run listener
+      - name: Run Telegram listener
         env:
-          PYTHONUNBUFFERED: "1"
-          RUN_MINUTES: "350"
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
